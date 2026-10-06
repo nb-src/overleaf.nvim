@@ -151,67 +151,86 @@ function M._attach_lsp(bufnr, ft)
   end
 end
 
+--- Is the byte at 1-based index i a UTF-8 continuation byte?
+local function is_cont(s, i)
+  local b = s:byte(i)
+  return b ~= nil and b >= 0x80 and b < 0xC0
+end
+
+--- Compute the ops turning `old` into `new` as one delete + one insert,
+--- from the longest common prefix and suffix (aligned to UTF-8 characters).
+---@param old string
+---@param new string
+---@return table[] ops (0-based character offsets)
+function M.diff_ops(old, new)
+  if old == new then return {} end
+  local lo, ln = #old, #new
+  local max = math.min(lo, ln)
+
+  local p = 0
+  while p < max and old:byte(p + 1) == new:byte(p + 1) do
+    p = p + 1
+  end
+  while p > 0 and (is_cont(old, p + 1) or is_cont(new, p + 1)) do
+    p = p - 1
+  end
+
+  local sfx = 0
+  while sfx < max - p and old:byte(lo - sfx) == new:byte(ln - sfx) do
+    sfx = sfx + 1
+  end
+  while sfx > 0 and (is_cont(old, lo - sfx + 1) or is_cont(new, ln - sfx + 1)) do
+    sfx = sfx - 1
+  end
+
+  local char_p = ot.byte_to_char(old, p)
+  local deleted = old:sub(p + 1, lo - sfx)
+  local inserted = new:sub(p + 1, ln - sfx)
+  local ops = {}
+  if #deleted > 0 then table.insert(ops, { p = char_p, d = deleted }) end
+  if #inserted > 0 then table.insert(ops, { p = char_p, i = inserted }) end
+  return ops
+end
+
+--- Diff the buffer against doc.content and submit whatever changed.
+--- Diffing whole text (instead of rebuilding each on_bytes event) cannot drift:
+--- some commands (J, :s, undo, paste, set_lines) report byte events that don't
+--- map 1:1 onto the final text, which caused "Content divergence" rejoins.
+---@param buf number
+---@param doc table Document instance
+function M.sync_from_buffer(buf, doc)
+  if doc.applying_remote or not doc.joined then return end
+  -- A remote op is queued for this buffer: diffing now would treat it as a
+  -- local deletion. apply_remote syncs local changes once it is done.
+  if (doc.remote_pending or 0) > 0 then return end
+  if not vim.api.nvim_buf_is_valid(buf) then return end
+  local new = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), '\n')
+  local ops = M.diff_ops(doc.content, new)
+  if #ops == 0 then return end
+  doc.content = new
+  doc:submit_op(ops)
+  require('overleaf.sync').schedule_write(doc)
+end
+
 --- Attach on_bytes listener to buffer for change detection
 ---@param bufnr number
 ---@param doc table Document instance
 function M.attach(bufnr, doc)
   vim.api.nvim_buf_attach(bufnr, false, {
-    on_bytes = function(
-      _,
-      buf,
-      _changedtick,
-      start_row,
-      start_col,
-      byte_offset,
-      _old_end_row,
-      _old_end_col,
-      old_end_byte,
-      new_end_row,
-      new_end_col,
-      new_end_byte
-    )
+    on_bytes = function(_, buf)
       -- Guard: ignore changes triggered by applying remote ops
       if doc.applying_remote then return end
-
       -- Guard: ignore if document not joined
       if not doc.joined then return end
-
-      local ops = {}
-
-      -- Convert byte offset to character offset for Overleaf protocol
-      local char_offset = ot.byte_to_char(doc.content, byte_offset)
-
-      -- Delete operation
-      if old_end_byte > 0 then
-        local deleted_text = doc.content:sub(byte_offset + 1, byte_offset + old_end_byte)
-        if #deleted_text > 0 then table.insert(ops, { p = char_offset, d = deleted_text }) end
-      end
-
-      -- Insert operation
-      if new_end_byte > 0 then
-        -- Read inserted text from buffer
-        local end_row = start_row + new_end_row
-        local end_col
-        if new_end_row == 0 then
-          end_col = start_col + new_end_col
-        else
-          end_col = new_end_col
-        end
-
-        local ok, new_lines = pcall(vim.api.nvim_buf_get_text, buf, start_row, start_col, end_row, end_col, {})
-        if ok and new_lines then
-          local inserted_text = table.concat(new_lines, '\n')
-          if #inserted_text > 0 then table.insert(ops, { p = char_offset, i = inserted_text }) end
-        end
-      end
-
-      if #ops > 0 then
-        -- Update content mirror
-        doc.content = ot.apply(doc.content, ops)
-        -- Submit to document for OT processing
-        doc:submit_op(ops)
-        -- Sync to disk for external tools
-        require('overleaf.sync').schedule_write(doc)
+      M.sync_from_buffer(buf, doc)
+      -- Some commands (J, :s) fire on_bytes before the buffer holds the final
+      -- text, so diff once more after the command has finished.
+      if not doc._sync_scheduled then
+        doc._sync_scheduled = true
+        vim.schedule(function()
+          doc._sync_scheduled = false
+          M.sync_from_buffer(buf, doc)
+        end)
       end
     end,
   })
@@ -223,7 +242,10 @@ end
 function M.apply_remote(doc, ops)
   if not doc.bufnr or not vim.api.nvim_buf_is_valid(doc.bufnr) then return end
 
+  doc.remote_pending = (doc.remote_pending or 0) + 1
   vim.schedule(function()
+    doc.remote_pending = doc.remote_pending - 1
+    if not vim.api.nvim_buf_is_valid(doc.bufnr) then return end
     doc.applying_remote = true
 
     local had_error = false
@@ -265,6 +287,8 @@ function M.apply_remote(doc, ops)
 
     vim.bo[doc.bufnr].modified = false
     doc.applying_remote = false
+    -- Submit any local edits made while this remote op was queued
+    if doc.remote_pending == 0 then M.sync_from_buffer(doc.bufnr, doc) end
   end)
 end
 

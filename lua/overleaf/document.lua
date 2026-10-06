@@ -85,7 +85,8 @@ function Document:flush()
   if not self.joined or self._rejoining then return end
   if self.inflight_op or not self.pending_ops then return end
 
-  -- Pre-flight check: verify buffer and doc.content are in sync
+  -- Pick up any buffer change not yet diffed, then verify buffer and doc.content are in sync
+  if self.bufnr then require('overleaf.buffer').sync_from_buffer(self.bufnr, self) end
   if not self:check_content() then
     return -- check_content triggers rejoin on mismatch
   end
